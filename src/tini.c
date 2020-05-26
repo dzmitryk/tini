@@ -84,17 +84,28 @@ static const struct {
    { "SIGSYS", SIGSYS },
 };
 
+struct Node {
+  char* value;
+  struct Node* next;
+};
+
+typedef struct {
+  int size;
+  struct Node* head;
+  struct Node* tail;
+} arg_list;
+
 static unsigned int verbosity = DEFAULT_VERBOSITY;
 
 static int32_t expect_status[(STATUS_MAX - STATUS_MIN + 1) / 32];
 
 #ifdef PR_SET_CHILD_SUBREAPER
 #define HAS_SUBREAPER 1
-#define OPT_STRING "p:hvwgle:s"
+#define OPT_STRING "p:hvwgle:sx"
 #define SUBREAPER_ENV_VAR "TINI_SUBREAPER"
 #else
 #define HAS_SUBREAPER 0
-#define OPT_STRING "p:hvwgle:"
+#define OPT_STRING "p:hvwgle:x"
 #endif
 
 #define VERBOSITY_ENV_VAR "TINI_VERBOSITY"
@@ -110,6 +121,8 @@ static unsigned int parent_death_signal = 0;
 static unsigned int kill_process_group = 0;
 
 static unsigned int warn_on_reap = 0;
+
+static unsigned int expand_env_variables = 0;
 
 static struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
 
@@ -177,6 +190,95 @@ int isolate_child() {
 	return 0;
 }
 
+struct Node* append(arg_list* args, char* arg) {
+	if (args->head == NULL) {
+		args->size = 0;
+	}
+
+	if (arg != NULL) {
+		struct Node* new_arg = (struct Node*) calloc(1, sizeof(struct Node));
+		new_arg->value = arg;
+		new_arg->next = NULL;
+
+		if (args->head == NULL) {
+			args->head = new_arg;
+		}
+
+		if (args->tail == NULL) {
+			args->tail = new_arg;
+		} else {
+			args->tail->next = new_arg;
+			args->tail = new_arg;
+		}
+
+		args->size++;
+
+		return new_arg;
+	}
+
+	return NULL;
+}
+
+int to_args_array(arg_list* args, char** args_array) {
+	int i = 0;
+	struct Node* current = args->head;
+
+	while (current != NULL) {
+		args_array[i++] = current->value;
+		current = current->next;
+	}
+
+	args_array[i] = NULL;
+
+	return 0;
+}
+
+int free_arg_list(arg_list* args) {
+	struct Node* current = args->head;
+
+	while (current != NULL) {
+		struct Node* node = current;
+		current = current->next;
+		free(node);
+	}
+
+	return 0;
+}
+
+arg_list expand(char* const argv[]) {
+	arg_list args;
+
+	append(&args, argv[0]);
+
+	int i = 1;
+
+	while (argv[i] != NULL) {
+		if (argv[i][0] == '$') {
+			int arg_len = strlen(argv[i]);
+
+			char res[arg_len];
+
+			strncpy(res, &argv[i][1], arg_len);
+			res[arg_len] = '\0';
+			
+			char *envvalue = getenv(res);
+			
+			if (envvalue != NULL) {
+				char* token;
+				token = strtok(envvalue, " ");
+				while (token != NULL) {
+					append(&args, token);
+					token = strtok(NULL, " ");
+				}
+			} 
+		} else {
+			append(&args, argv[i]);
+		}
+		i++;
+	}
+
+	return args;
+}
 
 int spawn(const signal_configuration_t* const sigconf_ptr, char* const argv[], int* const child_pid_ptr) {
 	pid_t pid;
@@ -199,7 +301,15 @@ int spawn(const signal_configuration_t* const sigconf_ptr, char* const argv[], i
 			return 1;
 		}
 
-		execvp(argv[0], argv);
+		if (expand_env_variables == 0) {
+			execvp(argv[0], argv);
+		} else {
+			arg_list args = expand(argv);
+			char* expanded_argv[args.size + 1];
+			to_args_array(&args, expanded_argv);
+			free_arg_list(&args);
+			execvp(expanded_argv[0], expanded_argv);
+		}
 
 		// execvp will only return on an error so make sure that we check the errno
 		// and exit with the correct return status for the error that we encountered
@@ -248,6 +358,7 @@ void print_usage(char* const name, FILE* const file) {
 	fprintf(file, "  -w: Print a warning when processes are getting reaped.\n");
 	fprintf(file, "  -g: Send signals to the child's process group.\n");
 	fprintf(file, "  -e EXIT_CODE: Remap EXIT_CODE (from 0 to 255) to 0.\n");
+	fprintf(file, "  -x: Expand environment variables.\n");
 	fprintf(file, "  -l: Show license and exit.\n");
 #endif
 
@@ -355,7 +466,9 @@ int parse_args(const int argc, char* const argv[], char* (**child_args_ptr_ptr)[
 					return 1;
 				}
 				break;
-
+			case 'x':
+				expand_env_variables++;
+				break;
 			case 'l':
 				print_license(stdout);
 				*parse_fail_exitcode_ptr = 0;
